@@ -12,23 +12,12 @@ use pcap::{Device, Capture, DeviceFlags, IfFlags, Activated};
 struct ParseMacError;
 
 fn parse_mac(mac_str: &str) -> Result<[u8; 6], ParseMacError> {
-    let mut res = [0u8; 6];
-    let mut i = 0;
-    for oct_str in mac_str.split(':') {
-        if i > 5 {
-            return Err(ParseMacError);
-        }
-
-        res[i] = u8::from_str_radix(oct_str, 16).map_err(|_| ParseMacError)?;
-
-        i += 1;
-    }
-
-    if i < 6 {
-        return Err(ParseMacError);
-    }
-
-    Ok(res)
+    mac_str
+        .split(':')
+        .filter_map(|x| u8::from_str_radix(x, 16).ok())
+        .collect::<Vec<u8>>()
+        .try_into()
+        .map_err(|_| ParseMacError)
 }
 
 #[derive(Parser)]
