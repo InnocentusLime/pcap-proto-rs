@@ -1,4 +1,3 @@
-mod util;
 pub mod proto;
 use std::{path::PathBuf, net::Ipv4Addr};
 

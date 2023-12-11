@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+etherparse = "0.13"
 clap = { version = "4", features = [ "derive" ] }
 bytes = "1"
 anyhow = "1"
@@ -13,4 +14,3 @@ pcap = "1"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 thiserror = "1"
-bytemuck = { version = "1", features = [ "derive" ] }

@@ -1,9 +1,11 @@
 use std::net::Ipv4Addr;
 
-use super::util::*;
-use bytemuck::{Pod, Zeroable};
-use bytes::{BufMut, Buf};
+use bytes::{BufMut, Buf, BytesMut};
+use etherparse::{Ethernet2Header, Ipv4Header, Icmpv4Header, SerializedSize};
+use etherparse::{ip_number, ether_type, IcmpEchoHeader};
 use thiserror::Error;
+
+const ICMP_HEADER_LEN: usize = 24;
 
 #[derive(Clone, Copy)]
 pub struct NetworkCfg {
@@ -21,90 +23,90 @@ static HANDSHAKE_STR : HandshakeStr = [
     0xbe, 0xef,
 ];
 
-#[repr(C, packed)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+// TODO: add timestamp: [0; 16],
+#[derive(PartialEq, Eq, Clone)]
 pub struct PacketHeader {
-    pub eth: EthHeader,
-    pub ipv4: IPv4header,
-    pub icmp: ICMPheader,
+    pub eth: Ethernet2Header,
+    pub ipv4: Ipv4Header,
+    pub icmpv4: Icmpv4Header,
 }
 
 impl PacketHeader {
+    pub const HEADER_LEN: usize =
+        Ethernet2Header::SERIALIZED_SIZE +
+        Ipv4Header::SERIALIZED_SIZE +
+        ICMP_HEADER_LEN;
+
     pub fn new(cfg: NetworkCfg) -> Self {
         PacketHeader {
-            eth: EthHeader {
-                dst: cfg.client_mac,
-                src: cfg.server_mac,
-                ty: ETHERNET_TYPE_IPV4,
+            eth: Ethernet2Header {
+                source: cfg.client_mac,
+                destination: cfg.server_mac,
+                ether_type: ether_type::IPV4,
             },
-            ipv4: IPv4header {
-                version_and_head_length: IPV4_AND_NORMAL_LENGTH,
-                dcsp_and_ecn: 0, // Zeroed (cuz deprecated) + no CN
-                total_len: 0,
-                identification: 0,
+            ipv4: Ipv4Header::new(
+                0,
+                64, // TODO: configure?
+                ip_number::ICMP,
+                cfg.client_ip.octets(),
+                cfg.server_ip.octets(),
+            ),
+            icmpv4: Icmpv4Header {
+                icmp_type: etherparse::Icmpv4Type::EchoRequest(IcmpEchoHeader {
+                    id: 0xfff,
+                    seq: 0xffff,
+                }),
                 checksum: 0,
-                src: u32::from_ne_bytes(cfg.client_ip.octets()),
-                dst: u32::from_ne_bytes(cfg.server_ip.octets()),
-            },
-            icmp: ICMPheader {
-                ty: ICMP_ECHO_REQUEST,
-                code: 0,
-                checksum: 0,
-                id: 0xffff,
-                seq: 0xffff,
-                timestamp: [0; 16],
             },
         }
     }
 
-    pub fn change_for_payload(
-        &mut self,
-        actual_payload_len: u16,
-        payload: impl Iterator<Item = u16>,
-    ) {
-        self.apply_payload_len(actual_payload_len);
-        self.apply_checksum(payload);
+    pub fn from_bytes<B: Buf>(bytes: &mut B) -> Result<Self, ParseError> {
+        if bytes.remaining() < Self::HEADER_LEN {
+            return Err(ParseError::BufferTooSmall);
+        }
+
+        let eth = {
+            let mut buff = [0u8; Ethernet2Header::SERIALIZED_SIZE];
+            bytes.copy_to_slice(&mut buff);
+            Ethernet2Header::from_bytes(buff)
+        };
+        let ipv4 = {
+            let mut buff = [0u8; Ipv4Header::SERIALIZED_SIZE];
+            bytes.copy_to_slice(&mut buff);
+            Ipv4Header::from_slice(&buff)
+                .map_err(|_| ParseError::InvalidPacket)?.0
+        };
+        let icmpv4 = {
+            let mut buff = [0u8; ICMP_HEADER_LEN];
+            bytes.copy_to_slice(&mut buff);
+            Icmpv4Header::from_slice(&buff)
+                .map_err(|_| ParseError::InvalidPacket)?.0
+        };
+
+        Ok(PacketHeader { eth, ipv4, icmpv4 })
+    }
+
+    pub fn write_bytes<B: BufMut>(&self, buff: &mut B) {
+        assert!(buff.remaining_mut() < Self::HEADER_LEN, "Write buffer is too small");
+
+        buff.put_slice(&self.eth.to_bytes());
+        self.ipv4.write(&mut buff.writer()).unwrap();
+        buff.put_slice(&self.icmpv4.to_bytes());
+    }
+
+    pub fn update_for_payload(&mut self, payload: &[u8]) {
+        self.ipv4.payload_len = payload.len() as u16;
+        self.update_checksum(payload);
     }
 
     #[inline]
-    pub fn from_bytes(bytes: &[u8]) -> Option<&PacketHeader> {
-        bytemuck::try_from_bytes(bytes).ok()
-    }
+    fn update_checksum(&mut self, payload: &[u8]) {
+        // TODO: is that okay?
+        self.ipv4.header_checksum = self.ipv4.calc_header_checksum().unwrap();
 
-    #[inline]
-    pub fn from_bytes_mut(bytes: &mut [u8]) -> Option<&mut PacketHeader> {
-        bytemuck::try_from_bytes_mut(bytes).ok()
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        bytemuck::bytes_of(self)
-    }
-
-    #[inline]
-    fn apply_payload_len(&mut self, payload_len: u16) {
-        self.ipv4.total_len =
-            std::mem::size_of::<IPv4header>() as u16 +
-            std::mem::size_of::<ICMPheader>() as u16 +
-            payload_len;
-    }
-
-    #[inline]
-    fn apply_ipv4_checksum(&mut self) {
-        self.ipv4.checksum = 0;
-        self.ipv4.checksum = internet_checksum(
-            slice_as_padded_u16_stream(bytemuck::bytes_of(&self.ipv4))
-        );
-    }
-
-    #[inline]
-    fn apply_checksum(&mut self, icmp_data: impl Iterator<Item = u16>) {
-        self.apply_ipv4_checksum();
-
-        self.icmp.checksum = 0;
-        self.icmp.checksum = internet_checksum(
-            slice_as_padded_u16_stream(bytemuck::bytes_of(&self.icmp))
-            .chain(icmp_data)
-        );
+        self.icmpv4.checksum = 0;
+        self.icmpv4.update_checksum(payload);
     }
 }
 
@@ -128,8 +130,7 @@ pub enum PutError {
     BufferTooSmall,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy)]
 pub struct VpnCfg {
     pub virt_ip: u32,
     pub subnet_mask: u32,
@@ -145,6 +146,7 @@ enum ProtoState {
 pub struct ProtoContext {
     head: PacketHeader,
     state: ProtoState,
+    buffer: BytesMut,
 }
 
 impl ProtoContext {
@@ -152,51 +154,63 @@ impl ProtoContext {
         ProtoContext {
             head: PacketHeader::new(cfg),
             state: ProtoState::Handshake,
+            buffer: BytesMut::with_capacity(100),
         }
     }
 
-    pub fn parse_packet<B: Buf, P: BufMut>(
+    pub fn parse_packet<B: Buf>(
         &mut self,
-        buff: &mut B,
-        payload: &mut P,
-    ) -> Result<usize, ParseError> {
-        let packet_len = buff.remaining();
-
-        if packet_len < std::mem::size_of::<PacketHeader>() {
-            return Err(ParseError::BufferTooSmall);
-        }
-
-        let mut header = PacketHeader::zeroed();
-        buff.copy_to_slice(bytemuck::bytes_of_mut(&mut header));
+        payload: &mut B,
+    ) -> Result<Option<&[u8]>, ParseError> {
+        let header = PacketHeader::from_bytes(payload)?;
+        let enc_payload = payload.copy_to_bytes(
+            header.ipv4.payload_len as usize - header.icmpv4.header_len()
+        );
 
         /* Construct a sample of the expected header */
-        let mut expect_head = self.head;
-        std::mem::swap(&mut expect_head.eth.src, &mut expect_head.eth.dst);
-        let temp = expect_head.ipv4.src;
-        expect_head.ipv4.total_len = (packet_len - std::mem::size_of::<EthHeader>()) as u16;
-        expect_head.ipv4.src = expect_head.ipv4.dst;
-        expect_head.ipv4.dst = temp;
-        expect_head.icmp.ty = ICMP_ECHO_RESPONSE;
-        expect_head.apply_ipv4_checksum();
+        let mut expect_head = self.head.clone();
+        std::mem::swap(&mut expect_head.eth.source, &mut expect_head.eth.destination);
+        std::mem::swap(&mut expect_head.ipv4.source, &mut expect_head.ipv4.destination);
+        expect_head.ipv4.payload_len = header.ipv4.payload_len;
+        expect_head.icmpv4.icmp_type = etherparse::Icmpv4Type::EchoReply(IcmpEchoHeader {
+            id: 0xfff,
+            seq: 0xffff,
+        });
+        expect_head.update_checksum(&enc_payload);
 
-        /* Compare to the sample, but don't check icmp checksum YET */
-        let head_l = bytemuck::bytes_of(&header);
-        let head_r = bytemuck::bytes_of(&expect_head);
-        if &head_l[0..32] != &head_r[0..32] {
-            return Err(ParseError::InvalidPacket);
-        }
-        if &head_l[34..54] != &head_r[34..54] {
+        if header != expect_head {
             return Err(ParseError::InvalidPacket);
         }
 
+        /* Process the data */
         match self.state {
             ProtoState::Handshake => {
-                let cfg = Self::read_handshake(buff)?;
-                self.apply_network_cfg(cfg);
+                if payload.remaining() < std::mem::size_of::<VpnCfg>() {
+                    return Err(ParseError::BufferTooSmall);
+                }
+                self.apply_network_cfg(VpnCfg {
+                    virt_ip: payload.get_u32(),
+                    subnet_mask: payload.get_u32(),
+                    key: payload.get_u64(),
+                });
 
-                Ok(0)
+                Ok(None)
             },
-            ProtoState::HandshakeDone(cfg) => Self::read_payload(buff, payload, cfg.key),
+            ProtoState::HandshakeDone(cfg) => {
+                /* Now read the payload len */
+                if payload.remaining() < 2 {
+                    return Err(ParseError::BufferTooSmall);
+                }
+                let true_payload_len = payload.get_u16() as usize;
+
+                /* Now decrypt the payload */
+                let read = self.decrypt(payload, cfg.key, true_payload_len as u16);
+                if read < true_payload_len {
+                    return Err(ParseError::BufferTooSmall);
+                }
+
+                Ok(Some(&self.buffer))
+            },
         }
     }
 
@@ -218,13 +232,10 @@ impl ProtoContext {
         }
 
         /* Prepare header */
-        self.head.change_for_payload(
-            payload_len as u16,
-            slice_as_padded_u16_stream(&HANDSHAKE_STR),
-        );
+        self.head.update_for_payload(&HANDSHAKE_STR);
 
         /* Write */
-        buff.put_slice(self.head.as_bytes());
+        self.head.write_bytes(buff);
         buff.put_slice(&HANDSHAKE_STR);
 
         Ok(())
@@ -232,7 +243,7 @@ impl ProtoContext {
 
     pub fn write_payload<B: BufMut>(
         &mut self,
-        payload: &[u8],
+        mut payload: &[u8],
         buff: &mut B,
     ) -> Result<(), PutError> {
         /* Better check the key first */
@@ -240,29 +251,16 @@ impl ProtoContext {
             ProtoState::HandshakeDone(x) => x.key,
             _ => return Err(PutError::NoKey),
         };
-
-        /* Normal payload: header + 2 + padded data */
-        let mut payload_len = payload.len();
-        payload_len += payload_len % 4;
-        let expect_len = 2 + std::mem::size_of::<PacketHeader>() + payload_len;
-        if buff.remaining_mut() <= expect_len {
-            return Err(PutError::BufferTooSmall)
-        }
+        self.encrypt(&mut payload, key);
 
         /* Prepare header */
         let actual_len = payload.len() as u16;
-        self.head.change_for_payload(
-            actual_len,
-            Self::split_u64(
-                Self::encrypt(Self::blocky_bytes(payload), key)
-            )
-        );
+        self.head.update_for_payload(&self.buffer);
 
         /* Write */
-        buff.put_slice(self.head.as_bytes());
+        self.head.write_bytes(buff);
         buff.put_u16(actual_len);
-        Self::encrypt(Self::blocky_bytes(payload), key)
-            .for_each(|block| buff.put_u64_ne(block));
+        buff.put_slice(&self.buffer);
 
         Ok(())
     }
@@ -274,52 +272,6 @@ impl ProtoContext {
         }
     }
 
-    fn read_handshake<B: Buf>(
-        buff: &mut B,
-    ) -> Result<VpnCfg, ParseError> {
-        if buff.remaining() < std::mem::size_of::<VpnCfg>() {
-            return Err(ParseError::BufferTooSmall);
-        }
-
-        let mut cfg = VpnCfg::zeroed();
-        buff.copy_to_slice(bytemuck::bytes_of_mut(&mut cfg));
-
-        Ok(cfg)
-    }
-
-    fn read_payload<B: Buf, P: BufMut>(
-        buff: &mut B,
-        payload: &mut P,
-        key: u64,
-    ) -> Result<usize, ParseError> {
-        /* Now read the payload len */
-        let mut payload_len = buff.remaining();
-        if payload_len < 2 {
-            return Err(ParseError::BufferTooSmall);
-        }
-        payload_len -= 2;
-        let true_payload_len = buff.get_u16() as usize;
-        if payload_len != (true_payload_len + true_payload_len % 8) {
-            return Err(ParseError::BufferTooSmall); // Sanity check ;)
-        }
-
-        /* Now decrypt the payload */
-        if payload.remaining_mut() < true_payload_len {
-            return Err(ParseError::BufferTooSmall);
-        }
-        let block_stream = std::iter::from_fn(||
-            buff.has_remaining().then(|| buff.get_u64_ne())
-        );
-        let block_stream = Self::decrypt(block_stream, key);
-        // Might be slow, but was the simplest thing to do
-        let mut cnt = 0;
-        block_stream.flat_map(u64::to_le_bytes).take(true_payload_len)
-            .for_each(|x| { payload.put_u8(x); cnt += 1 });
-        debug_assert!(cnt == true_payload_len); // One more sanity check
-
-        Ok(true_payload_len)
-    }
-
     fn apply_network_cfg(&mut self, cfg: VpnCfg) {
         let virt_addr = Ipv4Addr::from(cfg.virt_ip);
         let net_addr = Ipv4Addr::from(cfg.virt_ip | cfg.subnet_mask);
@@ -329,35 +281,49 @@ impl ProtoContext {
         self.state = ProtoState::HandshakeDone(cfg);
     }
 
-    fn blocky_bytes<'a>(bytes: &'a [u8]) -> impl Iterator<Item = u64> + 'a {
-        bytes.chunks(4)
-            .map(|x| {
-                let mut y = [0; 8]; // TODO random padding
-                y.iter_mut().zip(x.iter()).for_each(|(y, x)| *y = *x);
+    #[inline]
+    fn decrypt<B: Buf>(
+        &mut self,
+        payload: &mut B,
+        key: u64,
+        real_len: u16,
+    ) -> usize {
+        debug_assert!(payload.remaining() % 8 == 0);
+        let mut put = 0;
 
-                u64::from_ne_bytes(y)
-            })
+        self.buffer.clear();
+        std::iter::from_fn(||
+            payload.has_remaining().then(|| payload.get_u64())
+        )
+            .map(|block| block ^ key)
+            .flat_map(u64::to_ne_bytes)
+            .take(real_len as usize)
+            .for_each(|b| { put += 1; self.buffer.put_u8(b) });
+
+       put
     }
 
     #[inline]
-    fn split_u64(it: impl Iterator<Item = u64>) -> impl Iterator<Item = u16> {
-        it.map(|x| x.to_ne_bytes())
-        .flat_map(|x| [
-            [x[0], x[1]],
-            [x[2], x[3]],
-            [x[4], x[5]],
-            [x[6], x[7]],
-        ].map(u16::from_ne_bytes))
-    }
+    fn encrypt<B: Buf>(
+        &mut self,
+        payload: &mut B,
+        key: u64,
+    ) -> usize {
+        let mut put = 0;
+        self.buffer.clear();
 
-    #[inline]
-    fn decrypt(payload: impl Iterator<Item = u64>, key: u64) -> impl Iterator<Item = u64> {
-        Self::encrypt(payload, key)
-    }
+        std::iter::from_fn(|| payload.has_remaining().then(|| {
+            let mut buff = [0u8; 8];
+            let len = std::cmp::min(8, payload.remaining());
 
-    #[inline]
-    fn encrypt(payload: impl Iterator<Item = u64>, key: u64) -> impl Iterator<Item = u64> {
-        payload.map(move |x| x ^ key)
+            payload.copy_to_slice(&mut buff[0..len]);
+            buff
+        }))
+            .map(u64::from_ne_bytes)
+            .map(|x| x ^ key)
+            .for_each(|x| { put += 8; self.buffer.put_u64(x) });
+
+        put
     }
 
 }
