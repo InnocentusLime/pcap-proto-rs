@@ -125,7 +125,12 @@ fn guess_net_cfg(net_cfg: NetworkCfgCli, dev: &Device) -> anyhow::Result<Network
         anyhow::bail!("Can't guess server MAC")
     };
 
-    Ok(todo!())
+    Ok(NetworkCfg {
+        server_mac,
+        client_mac: todo!(),
+        server_ip: todo!(),
+        client_ip: todo!(),
+    })
 }
 
 fn get_cap(
@@ -174,7 +179,7 @@ fn print_device_flags(flags: &DeviceFlags) {
     let is_running = flags.intersects(IfFlags::RUNNING);
     let is_up = flags.intersects(IfFlags::UP);
     let is_wireless = flags.intersects(IfFlags::WIRELESS);
-    println!("Flags={:4x}\tLOOPBACK={is_loopback}\tRUNNING={is_running}\tUP={is_up}\tWIRELESS={is_wireless}", flags.bits());
+    println!("Flags={:04x}\tLOOPBACK={is_loopback}\tRUNNING={is_running}\tUP={is_up}\tWIRELESS={is_wireless}", flags.bits());
 }
 
 fn find_device<'a>(name: &str, devs: &'a[Device]) -> anyhow::Result<&'a Device> {
