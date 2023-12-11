@@ -120,7 +120,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn guess_net_cfg(net_cfg: NetworkCfgCli, dev: Device) -> anyhow::Result<NetworkCfg> {
+fn guess_net_cfg(net_cfg: NetworkCfgCli, dev: &Device) -> anyhow::Result<NetworkCfg> {
     let Some(server_mac) = net_cfg.dst_mac else {
         anyhow::bail!("Can't guess server MAC")
     };
@@ -135,7 +135,7 @@ fn get_cap(
 ) -> anyhow::Result<Capture<dyn Activated>> {
     Ok(match (dev, file) {
         (Some(dev), _) => Capture::from_device(
-            find_device(&dev, devs)?
+            find_device(&dev, devs)?.clone()
         )?.open()?.into(),
         (_, Some(file)) => Capture::from_file(file)?.into(),
         _ => unreachable!(),
@@ -177,17 +177,8 @@ fn print_device_flags(flags: &DeviceFlags) {
     println!("Flags={:4x}\tLOOPBACK={is_loopback}\tRUNNING={is_running}\tUP={is_up}\tWIRELESS={is_wireless}", flags.bits());
 }
 
-fn find_device(name: &str, devs: &Vec<Device>) -> anyhow::Result<Device> {
-    let pos = devs.iter().position(|x| x.name == name.trim());
-    if let Some(pos) = pos {
-        return Ok(devs[pos].clone());
-    }
-
-    eprintln!("Device \"{name}\" not found. Avaliable devices:");
-    for dev in devs {
-        eprint!("{}, ", dev.name);
-    }
-    eprintln!("");
-
-    anyhow::bail!("No device")
+fn find_device<'a>(name: &str, devs: &'a[Device]) -> anyhow::Result<&'a Device> {
+    devs.iter()
+        .find(|x| x.name.eq_ignore_ascii_case(name.trim()))
+        .ok_or_else(|| anyhow::anyhow!("Device \"{name}\" not found"))
 }
